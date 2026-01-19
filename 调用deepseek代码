@@ -1,0 +1,208 @@
+import os
+import json
+import time
+from typing import Dict, Any, Optional
+
+import pandas as pd
+from tqdm import tqdm
+from openai import OpenAI
+
+# =========================
+# 你需要改的配置
+# =========================
+INPUT_XLSX = "内容结构分析.xlsx"       # 输入 Excel 路径
+SHEET_NAME = 0                    # 也可以写 "Sheet1"
+TEXT_COL = "内容正文"              # 你的文本列名（微博正文/内容列）
+OUTPUT_XLSX = "labeled.xlsx"
+
+# 断点续跑相关（建议保留）
+ID_COL: Optional[str] = "内容id"      # 如果你有唯一ID列，写列名，比如 "mid"/"id"；没有就 None
+SAVE_EVERY = 100                  # 每处理多少行就落盘一次
+SLEEP_S = 0.05                   # 需要限速就加 0.05 / 0.1
+
+# DeepSeek API
+MODEL_NAME = "deepseek-chat"      # 如果你明确有 v3.2 的模型名，换成你的
+BASE_URL = "https://api.deepseek.com"
+API_KEY_ENV = "DEEPSEEK_API_KEY"
+
+
+# =========================
+# 分类提示词（稳定输出 JSON）
+# =========================
+SYSTEM = """你是一个文本分类器，只输出JSON，不要输出任何多余文本。
+任务：判断文本属于什么[写作结构]
+label取值：
+- 总分：先用一句或数句总结性的话语或吸引人的开头切入，然后分点论述。
+- 总分总：在总分结构的基础上，结尾有一段总结性的话语。
+- 分总：前几句并没有总结性的话语或吸引人的开头，直接分点论述，结尾有一段总结意义的话语。
+- 直叙：不进行任何分点论述，像讲故事、聊天一样平铺直叙。
+输出格式严格为：
+{"label":"总分|总分总|分总|直叙","confidence":0-1,"reason":"不超过20字"}"""
+
+def keyword_prefilter(text: str) -> Optional[Dict[str, Any]]:
+    """
+    当前不启用关键词粗筛：永远返回 None，让大模型判。
+    如果以后要加粗筛规则，再在这里实现即可。
+    """
+    return None
+
+    # 计分：正向命中 +1，强词 +2；负向 -1
+
+
+def build_client() -> OpenAI:
+    api_key = os.getenv(API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(
+            f"未检测到环境变量 {API_KEY_ENV}。\n"
+            f"macOS/Linux: export {API_KEY_ENV}='你的key'\n"
+            f"Windows: setx {API_KEY_ENV} \"你的key\""
+        )
+    return OpenAI(api_key=api_key, base_url=BASE_URL)
+
+def llm_classify(client: OpenAI, text: str, max_retry: int = 3) -> Dict[str, Any]:
+    text = (text or "").strip()
+    if not text:
+        return {"label": "直叙", "confidence": 0.0, "reason": "空文本"}
+
+    last_err = None
+    for i in range(max_retry):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": f"待分类文本：{text}"}
+                ],
+                temperature=0
+            )
+            s = (resp.choices[0].message.content or "").strip()
+
+            # 兼容模型偶尔包裹 ```json
+            if s.startswith("```"):
+                s = s.strip("`")
+                s = s.replace("json", "", 1).strip()
+
+            out = json.loads(s)
+            label = out.get("label")
+            conf = out.get("confidence")
+            reason = out.get("reason", "")
+
+            valid_labels = ("总分", "总分总", "分总", "直叙")
+            if label not in valid_labels:
+                raise ValueError(f"bad label: {label}")
+            if not isinstance(conf, (int, float)):
+                raise ValueError(f"bad confidence: {conf}")
+
+            return {"label": label, "confidence": float(conf), "reason": str(reason)[:50]}
+
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (i + 1))
+
+    # 失败兜底
+    return {"label": "直叙", "confidence": 0.0, "reason": f"error:{type(last_err).__name__}"}
+
+def load_input(path: str, sheet_name=0) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+    return df
+
+def maybe_resume(df: pd.DataFrame, output_path: str) -> pd.DataFrame:
+    """
+    若 output 已存在，则读取并把已有 label/confidence/reason 合并回 df，实现断点续跑
+    """
+    try:
+        existing = pd.read_excel(output_path, engine="openpyxl")
+    except Exception:
+        return df
+
+    for col in ["label", "confidence", "reason"]:
+        if col not in existing.columns:
+            return df
+
+    if ID_COL and ID_COL in df.columns and ID_COL in existing.columns:
+        merged = df.merge(
+            existing[[ID_COL, "label", "confidence", "reason"]],
+            on=ID_COL,
+            how="left",
+            suffixes=("", "_old")
+        )
+        # 若 df 原本没有结果列，则用 merge 的结果
+        return merged
+
+    # 没有ID列则按行号对齐（要求输出与输入行顺序一致）
+    n = min(len(df), len(existing))
+    df = df.copy()
+    df.loc[:n-1, "label"] = existing.loc[:n-1, "label"].values
+    df.loc[:n-1, "confidence"] = existing.loc[:n-1, "confidence"].values
+    df.loc[:n-1, "reason"] = existing.loc[:n-1, "reason"].values
+    return df
+
+def save_xlsx(df: pd.DataFrame, path: str):
+    df.to_excel(path, index=False, engine="openpyxl")
+
+def main():
+    client = build_client()
+    df = load_input(INPUT_XLSX, sheet_name=SHEET_NAME)
+
+    if TEXT_COL not in df.columns:
+        raise ValueError(f"找不到文本列 {TEXT_COL}，当前列：{list(df.columns)}")
+
+    # 初始化输出列
+    for col in ["label", "confidence", "reason"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # 断点续跑
+    df = maybe_resume(df, OUTPUT_XLSX)
+
+    # 找到需要处理的行
+    to_process_idx = df.index[df["label"].isna()].tolist()
+    print(f"总行数: {len(df)}；待处理: {len(to_process_idx)}；已处理: {len(df)-len(to_process_idx)}")
+
+    ENABLE_KEYWORD_PREFILTER = False  # 你目前没写规则，就先关掉；要启用再改 True
+
+    processed = 0
+    for idx in tqdm(to_process_idx, desc="labeling"):
+        text = df.at[idx, TEXT_COL]
+
+        try:
+            # 先给一个兜底，保证 out 一定存在
+            out = {"label": "直叙", "confidence": 0.0, "reason": "fallback"}
+
+            if ENABLE_KEYWORD_PREFILTER:
+                pre = keyword_prefilter(str(text))
+                if pre is not None:
+                    out = pre
+                else:
+                    out = llm_classify(client, str(text))
+            else:
+                out = llm_classify(client, str(text))
+
+        except Exception as e:
+            # 任意异常都不让程序崩，写入错误原因
+            out = {"label": "直叙", "confidence": 0.0, "reason": f"exception:{type(e).__name__}"}
+
+        df.at[idx, "label"] = out.get("label", "直叙")
+        df.at[idx, "confidence"] = out.get("confidence", 0.0)
+        df.at[idx, "reason"] = out.get("reason", "")
+
+        processed += 1
+        if SLEEP_S:
+            time.sleep(SLEEP_S)
+
+        if processed % SAVE_EVERY == 0:
+            save_xlsx(df, OUTPUT_XLSX)
+
+        processed += 1
+        if SLEEP_S:
+            time.sleep(SLEEP_S)
+
+        # 定期落盘（断点续跑关键）
+        if processed % SAVE_EVERY == 0:
+            save_xlsx(df, OUTPUT_XLSX)
+
+    save_xlsx(df, OUTPUT_XLSX)
+    print("Done. Saved:", OUTPUT_XLSX)
+
+if __name__ == "__main__":
+    main()
